@@ -13,8 +13,9 @@
 `define InstAddrBus	31: 0
 `define InstBus		31: 0
 `define InstAddrWidth	32
-`define InstMemNum		32768
-`define InstMemNumLog2	15
+// IRAM: 32 KiB = 8192 x 32-bit words; word index is 13 bits.
+`define InstMemNum		8192
+`define InstMemNumLog2	13
 `define ChipEnable		1'b1
 `define ChipDisable	1'b0
 // regfile
@@ -26,8 +27,9 @@
 // 数据存储器
 `define DataAddrBus     31:0
 `define DataBus         31:0
-`define DataMemNum      32768
-`define DataMemNumLog2  15
+// DRAM: 32 KiB = 8192 x 32-bit words; word index is 13 bits.
+`define DataMemNum      8192
+`define DataMemNumLog2  13
 `define ByteWidth       7:0
 //aluex
 `define AluOpBus		10:0

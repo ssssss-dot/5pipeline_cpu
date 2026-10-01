@@ -1,43 +1,25 @@
 `include "define.sv"
 
-// CPU + UART program loader. One native memory port is exported for a future
-// DDR controller; this module does not instantiate a controller or a cache.
+// CPU、串口下载器、两块 32 KiB RAM 和 LED 寄存器的系统顶层。
 module cpu_loader_top #(
     parameter integer CLK_FREQ       = 100_000_000,
     parameter integer UART_BPS       = 115200,
+    parameter integer CPU_UART_BPS   = 115200,
     parameter integer LOADER_TIMEOUT = 100_000_000
 )(
-    input  wire                 clk,
+    input  wire                 sys_clk_p,
+    input  wire                 sys_clk_n,
     input  wire                 rst_n,
     input  wire                 irq_i,
     input  wire                 uart_rxd,
     output wire                 uart_txd,
+    output wire                 pl_led1,
+    output wire                 pl_led2,
 
-    output wire                 ddr_req_valid,
-    input  wire                 ddr_req_ready,
-    output reg  [31:0]          ddr_req_addr,
-    output reg  [31:0]          ddr_req_wdata,
-    output reg  [3:0]           ddr_req_wstrb,
-    output reg                  ddr_req_write,
-    input  wire                 ddr_rsp_valid,
-    output wire                 ddr_rsp_ready,
-    input  wire [31:0]          ddr_rsp_rdata,
-    input  wire                 ddr_rsp_error,
+    // 独立 CPU 打印串口；下载串口仍使用 uart_rxd/uart_txd。
+    output wire                 cpu_uart_txd,
 
-    output wire                 mmio_req_valid,
-    input  wire                 mmio_req_ready,
-    output wire [31:0]          mmio_req_addr,
-    output wire [31:0]          mmio_req_wdata,
-    output wire [3:0]           mmio_req_wstrb,
-    output wire                 mmio_req_write,
-    input  wire                 mmio_rsp_valid,
-    output wire                 mmio_rsp_ready,
-    input  wire [31:0]          mmio_rsp_rdata,
-
-    output wire [7:0]           cpu_uart_tx_data,
-    output wire                 cpu_uart_tx_valid,
-    input  wire                 cpu_uart_tx_ready,
-
+    //debug
     output wire                 loader_init_done_o,
     output wire                 loader_busy_o,
     output wire                 loader_pgm_done_o,
@@ -49,44 +31,33 @@ module cpu_loader_top #(
     output wire [31:0]          wb_wdata_o
 );
 
-localparam [1:0] IDLE = 2'd0, SEND = 2'd1, WAIT_RSP = 2'd2;
-localparam [1:0] INST = 2'd0, DATA = 2'd1, LOADER = 2'd2;
+// 板级差分时钟经过输入缓冲后，作为 CPU、RAM 和两路 UART 的内部时钟。
+// IBUFDS 是 FPGA 原语，无需单独生成 .xci 文件；频率仍由板上时钟决定。
+wire clk;
+IBUFDS u_ibufds_sys_clk (
+    .I  (sys_clk_p),
+    .IB (sys_clk_n),
+    .O  (clk)
+);
 
-wire loader_cpu_reset;
-reg  loader_reset_prev_q;
-reg  boot_command_seen_q;
+wire loader_cpu_reset; // 低有效：loader 下载时拉低，启动时拉高。
+reg  loader_reset_seen_q;
 wire cpu_rst_n;
 
-// The original loader releases reset during its INIT state. Hold the CPU in
-// reset until a later B0/B1 command has first asserted loader_cpu_reset low.
+// loader 在 INIT 中会自动释放复位，所以不能直接让 CPU 跟随它启动。
+// 初始化完成后，只需记住 loader 是否曾再次拉低复位，无须检测下降沿。
+// 下载前导码或 B0/B1 都会拉低复位；此时置位标志，但 CPU 仍保持复位。
+// 随后仅当 loader 因 B0 或 B1 清空完成而释放复位时，CPU 才开始运行。
+// 标志一直保留到系统复位，后续重新下载直接由 loader_cpu_reset 控制。
 always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        loader_reset_prev_q <= 1'b0;
-        boot_command_seen_q <= 1'b0;
-    end else begin
-        loader_reset_prev_q <= loader_cpu_reset;
-        if (loader_init_done_o && loader_reset_prev_q && !loader_cpu_reset)
-            boot_command_seen_q <= 1'b1;
-    end
+    if (!rst_n)
+        loader_reset_seen_q <= 1'b0;
+    else if (loader_init_done_o && !loader_cpu_reset)
+        loader_reset_seen_q <= 1'b1;
 end
 
-assign cpu_rst_n    = rst_n && boot_command_seen_q && loader_cpu_reset;
+assign cpu_rst_n = rst_n && loader_reset_seen_q && loader_cpu_reset;
 assign cpu_running_o = cpu_rst_n;
-
-wire        imem_req_valid;
-wire        imem_req_ready;
-wire [31:0] imem_req_addr;
-wire        imem_rsp_valid;
-wire [31:0] imem_rsp_rdata;
-
-wire        dmem_req_valid;
-wire        dmem_req_ready;
-wire [31:0] dmem_req_addr;
-wire [31:0] dmem_req_wdata;
-wire [3:0]  dmem_req_wstrb;
-wire        dmem_req_write;
-wire        dmem_rsp_valid;
-wire [31:0] dmem_rsp_rdata;
 
 wire        ldr_req_valid;
 wire        ldr_req_ready;
@@ -96,6 +67,20 @@ wire [3:0]  ldr_req_wstrb;
 wire        ldr_rsp_valid;
 wire        ldr_rsp_ready;
 wire        ldr_rsp_error;
+
+// CPU 侧接口先接内部连线，再与 loader 共用下面的 RAM 接口。
+wire imem_req_valid, imem_req_ready, imem_rsp_valid;
+wire [31:0] imem_req_addr, imem_rsp_rdata;
+wire dmem_req_valid, dmem_req_ready, dmem_req_write, dmem_rsp_valid;
+wire [31:0] dmem_req_addr, dmem_req_wdata, dmem_rsp_rdata;
+wire [3:0] dmem_req_wstrb;
+wire mmio_req_valid, mmio_req_ready, mmio_req_write;
+wire mmio_rsp_valid, mmio_rsp_ready;
+wire [31:0] mmio_req_addr, mmio_req_wdata, mmio_rsp_rdata;
+wire [3:0] mmio_req_wstrb;
+wire [7:0] cpu_uart_tx_data;
+wire cpu_uart_tx_valid, cpu_uart_tx_ready;
+wire ldr_ram_sel; // loader 的目标存储区：0 为 IRAM，1 为 DRAM。
 
 cpu_top u_cpu (
     .clk                (clk),
@@ -170,87 +155,128 @@ loader #(
     .ldr_rsp_valid    (ldr_rsp_valid),
     .ldr_rsp_ready    (ldr_rsp_ready),
     .ldr_rsp_error    (ldr_rsp_error),
-    .o_debug_ram_sel  ()
+    .o_debug_ram_sel  (ldr_ram_sel)
 );
 
-reg [1:0] state_q;
-reg [1:0] owner_q;
-wire selected_valid = owner_q == LOADER ? ldr_req_valid :
-                      owner_q == DATA   ? dmem_req_valid : imem_req_valid;
+// IRAM 请求选择：有 loader 指令写请求时优先，否则接收 CPU 取指。
+// cpu_rst_n 为 0 时禁止新的 CPU 请求；RAM 自身的 ready 防止事务重叠。
+wire iram_select_loader = ldr_req_valid && !ldr_ram_sel;
+wire iram_req_valid = iram_select_loader || (cpu_rst_n && imem_req_valid);
+wire iram_req_ready;
+// 转成 RAM 内部的字节偏移；当前两个指令基地址都为 0。
+wire [31:0] iram_req_addr = iram_select_loader
+    ? ldr_req_addr - `DDR_INST_BASE : imem_req_addr - `CPU_INST_BASE;
+// CPU 只读 IRAM，只有 loader 能写；读请求会忽略 wdata 和 wstrb，直接连线即可。
+wire [31:0] iram_req_wdata = ldr_req_wdata;
+wire [3:0] iram_req_wstrb = ldr_req_wstrb;
+wire iram_req_write = iram_select_loader;
+wire iram_rsp_valid, iram_rsp_ready;
+wire [31:0] iram_rsp_rdata;
+reg iram_owner_loader_q;
 
-// Latch the winning master before asserting DDR valid, so the selected
-// transaction stays stable while DDR is not ready. An unaccepted IF request
-// may be canceled on redirect by inst_ram; SEND then returns to IDLE.
+// 请求握手时记录来源：1 为 loader，0 为 CPU。
+// RAM 在响应结束前不会接受下一笔请求，所以等待期间归属不会改变。
 always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-        state_q <= IDLE;
-        owner_q <= INST;
-    end else begin
-        case (state_q)
-            IDLE: begin
-                if (ldr_req_valid) begin
-                    owner_q <= LOADER;
-                    state_q <= SEND;
-                end else if (dmem_req_valid) begin
-                    owner_q <= DATA;
-                    state_q <= SEND;
-                end else if (imem_req_valid) begin
-                    owner_q <= INST;
-                    state_q <= SEND;
-                end
-            end
-            SEND: begin
-                if (!selected_valid)
-                    state_q <= IDLE;
-                else if (ddr_req_ready)
-                    state_q <= WAIT_RSP;
-            end
-            WAIT_RSP: begin
-                if (ddr_rsp_valid && ddr_rsp_ready)
-                    state_q <= IDLE;
-            end
-            default: state_q <= IDLE;
-        endcase
-    end
+    if (!rst_n)
+        iram_owner_loader_q <= 1'b0;
+    else if (iram_req_valid && iram_req_ready)
+        iram_owner_loader_q <= iram_select_loader;
 end
 
-assign ddr_req_valid = (state_q == SEND) && selected_valid;
-assign ldr_req_ready = (state_q == SEND) && (owner_q == LOADER) && ddr_req_ready;
-assign dmem_req_ready = (state_q == SEND) && (owner_q == DATA) && ddr_req_ready;
-assign imem_req_ready = (state_q == SEND) && (owner_q == INST) && ddr_req_ready;
+assign imem_req_ready = cpu_rst_n && !iram_select_loader && iram_req_ready;
+// loader 的响应等待 ldr_rsp_ready；CPU 响应总是接收。
+// 若 CPU 已复位，旧响应仍被 RAM 正常完成，但不再交给 CPU，也不会交给 loader。
+assign iram_rsp_ready = iram_owner_loader_q ? ldr_rsp_ready : 1'b1;
+assign imem_rsp_valid = cpu_rst_n && !iram_owner_loader_q && iram_rsp_valid;
+assign imem_rsp_rdata = iram_rsp_rdata;
 
-always @(*) begin
-    ddr_req_addr  = 32'b0;
-    ddr_req_wdata = 32'b0;
-    ddr_req_wstrb = 4'b0;
-    ddr_req_write = 1'b0;
-    case (owner_q)
-        LOADER: begin
-            ddr_req_addr  = ldr_req_addr;
-            ddr_req_wdata = ldr_req_wdata;
-            ddr_req_wstrb = ldr_req_wstrb;
-            ddr_req_write = 1'b1;
-        end
-        DATA: begin
-            ddr_req_addr  = `DDR_DATA_BASE + {dmem_req_addr[31:2], 2'b00} - `CPU_DATA_BASE;
-            ddr_req_wdata = dmem_req_wdata;
-            ddr_req_wstrb = dmem_req_wstrb;
-            ddr_req_write = dmem_req_write;
-        end
-        default: begin
-            ddr_req_addr  = `DDR_INST_BASE + imem_req_addr - `CPU_INST_BASE;
-        end
-    endcase
+iram u_iram (
+    // RAM 接系统复位，下载时不能随 CPU 一起复位。
+    .clk(clk), .rst_n(rst_n),
+    .imem_req_valid(iram_req_valid),
+    .imem_req_ready(iram_req_ready),
+    .imem_req_addr(iram_req_addr),
+    .imem_req_wdata(iram_req_wdata),
+    .imem_req_wstrb(iram_req_wstrb),
+    .imem_req_write(iram_req_write),
+    .imem_rsp_valid(iram_rsp_valid),
+    .imem_rsp_ready(iram_rsp_ready),
+    .imem_rsp_rdata(iram_rsp_rdata)
+);
+
+// DRAM 请求选择：loader 写初始数据，CPU 可读写数据；loader 请求优先。
+wire dram_select_loader = ldr_req_valid && ldr_ram_sel;
+wire dram_req_valid = dram_select_loader || (cpu_rst_n && dmem_req_valid);
+wire dram_req_ready;
+// loader 地址减 0x1000_0000，CPU 地址减 0x8000_0000，得到相同的数据区偏移。
+wire [31:0] dram_req_addr = dram_select_loader
+    ? ldr_req_addr - `DDR_DATA_BASE : dmem_req_addr - `CPU_DATA_BASE;
+wire [31:0] dram_req_wdata = dram_select_loader ? ldr_req_wdata : dmem_req_wdata;
+wire [3:0] dram_req_wstrb = dram_select_loader ? ldr_req_wstrb : dmem_req_wstrb;
+wire dram_req_write = dram_select_loader ? 1'b1 : dmem_req_write;
+wire dram_rsp_valid, dram_rsp_ready;
+wire [31:0] dram_rsp_rdata;
+reg dram_owner_loader_q;
+
+// 只在请求被接受时更新来源，不能用当前 cpu_rst_n 判断旧响应属于谁。
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)
+        dram_owner_loader_q <= 1'b0;
+    else if (dram_req_valid && dram_req_ready)
+        dram_owner_loader_q <= dram_select_loader;
 end
 
-assign ddr_rsp_ready = (state_q == WAIT_RSP) &&
-                       ((owner_q == LOADER) ? ldr_rsp_ready : 1'b1);
-wire response_fire = ddr_rsp_valid && ddr_rsp_ready;
-assign ldr_rsp_valid  = response_fire && (owner_q == LOADER);
-assign ldr_rsp_error  = ddr_rsp_error;
-assign dmem_rsp_valid = response_fire && (owner_q == DATA);
-assign dmem_rsp_rdata = ddr_rsp_rdata;
-assign imem_rsp_valid = response_fire && (owner_q == INST);
-assign imem_rsp_rdata = ddr_rsp_rdata;
+assign dmem_req_ready = cpu_rst_n && !dram_select_loader && dram_req_ready;
+// 和 IRAM 一样，CPU 复位后仍接收并丢弃属于 CPU 的旧响应，避免堵住 RAM。
+assign dram_rsp_ready = dram_owner_loader_q ? ldr_rsp_ready : 1'b1;
+assign dmem_rsp_valid = cpu_rst_n && !dram_owner_loader_q && dram_rsp_valid;
+assign dmem_rsp_rdata = dram_rsp_rdata;
+
+dram u_dram (
+    .clk(clk), .rst_n(rst_n),
+    .dmem_req_valid(dram_req_valid),
+    .dmem_req_ready(dram_req_ready),
+    .dmem_req_addr(dram_req_addr),
+    .dmem_req_wdata(dram_req_wdata),
+    .dmem_req_wstrb(dram_req_wstrb),
+    .dmem_req_write(dram_req_write),
+    .dmem_rsp_valid(dram_rsp_valid),
+    .dmem_rsp_ready(dram_rsp_ready),
+    .dmem_rsp_rdata(dram_rsp_rdata)
+);
+
+// 请求 ready 由当前目标 RAM 返回；响应按锁存的来源汇合。
+// loader 同时最多有一笔未完成请求，因此两块 RAM 不会同时返回 loader 响应。
+assign ldr_req_ready = ldr_ram_sel ? dram_req_ready : iram_req_ready;
+assign ldr_rsp_valid = (iram_owner_loader_q && iram_rsp_valid) ||
+                       (dram_owner_loader_q && dram_rsp_valid);
+// 暂不增加地址范围检查。现有 RAM 没有错误接口，loader 内存错误输入固定为 0。
+assign ldr_rsp_error = 1'b0;
+
+wire [1:0] led_en;
+// LED 跟随 CPU 复位清零，同时取消重新下载前尚未完成的 MMIO 请求。
+led_reg u_led_reg (
+    .clk(clk), .rst_n(cpu_rst_n),
+    .mmio_req_valid(mmio_req_valid), .mmio_req_ready(mmio_req_ready),
+    .mmio_req_addr(mmio_req_addr), .mmio_req_wdata(mmio_req_wdata),
+    .mmio_req_wstrb(mmio_req_wstrb), .mmio_req_write(mmio_req_write),
+    .mmio_rsp_valid(mmio_rsp_valid), .mmio_rsp_ready(mmio_rsp_ready),
+    .mmio_rsp_rdata(mmio_rsp_rdata), .en(led_en)
+);
+
+// UART 发送器负责背压，CPU 只有在字节被接收后才完成打印写操作。
+// 跟随 CPU 复位，重新下载时停止旧程序打印；下载串口不受影响。
+uart_tx #(
+    .clk_freq(CLK_FREQ), .uart_bps(CPU_UART_BPS)
+) u_cpu_uart_tx (
+    .clk(clk), .rst_n(cpu_rst_n), .uart_tx_en(1'b1),
+    .uart_tx_data(cpu_uart_tx_data), .uart_tx_valid(cpu_uart_tx_valid),
+    .uart_tx_ready(cpu_uart_tx_ready), .uart_txd(cpu_uart_txd)
+);
+
+led u_led (
+    .en(led_en), .pl_led1(pl_led1), .pl_led2(pl_led2)
+);
 
 endmodule
+ 

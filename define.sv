@@ -331,6 +331,9 @@
 `define CONV_INPUT_BASE_ADDR  (`CONV_BASE_ADDR + 32'h1C)// 输入特征图在BRAM中的字节基地址
 `define CONV_WEIGHT_BASE_ADDR (`CONV_BASE_ADDR + 32'h20)// 权重在BRAM中的字节基地址
 
+//led控制
+`define LED_CTRL_ADDR 32'h4000_1000
+
 //加速器共享64KB的ram
 `define RAM_SIZE 0:16383
 //ram地址分配

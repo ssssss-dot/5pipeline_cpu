@@ -17,7 +17,7 @@ set project_dir [file join $source_dir "prj"]
 #   xc7a35tcsg324-1    ;# Artix-7, often used by Basys 3
 #   xc7z020clg400-1    ;# Zynq-7020
 #   xcku040-ffva1156-2 ;# Kintex UltraScale
-set part_name "xczu5ev-sfvc784-2-e(active)"
+set part_name "xczu5ev-sfvc784-2-e"
 
 # Top module/entity name
 set top_name "cpu_loader_top"

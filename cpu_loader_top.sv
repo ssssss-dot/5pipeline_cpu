@@ -10,26 +10,29 @@ module cpu_loader_top #(
     input  wire                 sys_clk_p,
     input  wire                 sys_clk_n,
     input  wire                 rst_n,
-    input  wire                 irq_i,
     input  wire                 uart_rxd,
     output wire                 uart_txd,
     output wire                 pl_led1,
     output wire                 pl_led2,
 
     // 独立 CPU 打印串口；下载串口仍使用 uart_rxd/uart_txd。
-    output wire                 cpu_uart_txd,
-
-    //debug
-    output wire                 loader_init_done_o,
-    output wire                 loader_busy_o,
-    output wire                 loader_pgm_done_o,
-    output wire                 loader_error_o,
-    output wire [4:0]           loader_error_code_o,
-    output wire                 cpu_running_o,
-    output wire                 wb_we_o,
-    output wire [4:0]           wb_waddr_o,
-    output wire [31:0]          wb_wdata_o
+    output wire                 cpu_uart_txd
 );
+// No board-level interrupt source is used; keep the CPU interrupt inactive.
+wire irq_i;
+assign irq_i = 1'b0;
+
+// Internal status/debug signals can be connected to an ILA when needed.
+wire        loader_init_done_o;
+wire        loader_busy_o;
+wire        loader_pgm_done_o;
+wire        loader_error_o;
+wire [4:0]  loader_error_code_o;
+wire        cpu_running_o;
+wire        wb_we_o;
+wire [4:0]  wb_waddr_o;
+wire [31:0] wb_wdata_o;
+
 
 // 板级差分时钟经过输入缓冲后，作为 CPU、RAM 和两路 UART 的内部时钟。
 // IBUFDS 是 FPGA 原语，无需单独生成 .xci 文件；频率仍由板上时钟决定。

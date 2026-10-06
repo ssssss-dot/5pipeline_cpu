@@ -30,6 +30,7 @@ platform/
 └── link.ld            IRAM/DRAM 段布局和栈空间约束
 python_tools/
 └── peqflash.py         下载、启动、独立打印串口监视
+bin2pqr5bin.py          原版重排工具，固定生成 C0 帧头；数据帧头单独处理
 README.md              架构、裸机程序、Linux LLVM 构建和下载说明
 LICENSE                许可证
 .gitignore             忽略软件构建结果与 Python 缓存
@@ -37,7 +38,7 @@ LICENSE                许可证
 
 `software/` 只保留 [led_uart.c](software/led_uart.c)。启动代码与链接脚本位于 `platform/`。当前目录没有 Makefile，按第 6 节的 Linux 命令直接调用 LLVM；执行后才会创建 `build/led_uart/`，生成结果不写回 `software/`。
 
-当前目录也没有 `tests/`、`check_rtl.py` 和 `pack_flash.py`。其中前两项不参与硬件综合或程序构建；`peqflash.py` 仍然导入 `pack_flash`，因此下载功能目前缺少依赖，详见第 7 节。
+两个 Python 脚本保留原版。`bin2pqr5bin.py` 负责重排；`peqflash.py` 仍依赖当前缺失的 `pack_flash.py`，下载前需要补齐该依赖，详见第 7 节。
 
 ## 2. 当前硬件架构
 
@@ -214,8 +215,8 @@ UART OK
 
 | 内容 | 地址/区域 | 下载与初始化方式 |
 | --- | --- | --- |
-| `.text.start`、`.text` | IRAM，从 `0x0000_0000` 开始 | 提取为 `imem.raw.bin`，经 loader 下载 |
-| 字符串常量、只读表、已初始化变量 | 合并进 `.data`，DRAM 从 `0x8000_0000` 开始 | 提取为 `dmem.raw.bin`，经 loader 下载 |
+| `.text.start`、`.text` | IRAM，从 `0x0000_0000` 开始 | 提取 `imem.raw.bin`，转换为 `imem.flash.bin` 后下载 |
+| 字符串常量、只读表、已初始化变量 | 合并进 `.data`，DRAM 从 `0x8000_0000` 开始 | 提取 `dmem.raw.bin`，转换为 `dmem.flash.bin` 后下载 |
 | `.bss` | 紧接 DRAM 的数据段，按 4 字节对齐 | 不进入镜像，由启动代码清零 |
 | 栈 | 预留 `0x8000_7000～0x8000_7FFF` | 初始 SP 为 `0x8000_8000`，向低地址增长 |
 
@@ -226,6 +227,8 @@ UART OK
 原汇编版的固定字符串偏移和 21 条指令表不再适用于 C 版本。字符串地址、寄存器分配、指令数量由编译器和链接器决定，构建后查看 `led_uart.map` 与 `program.lst`。
 
 ## 6. Linux 下使用 LLVM 编译裸机 C 程序
+
+独立操作文档：[Linux LLVM 编译指南](LLVM_LINUX_BUILD.md)，包含整段 Bash 构建命令、工具链选择、参数解释和结果检查。该指南按服务器 `led_test/` 中平铺的 `led_uart.c`、`start.s`、`linker.ld` 编写；本节命令则用于完整仓库的 `software/`、`platform/` 目录布局。
 
 ### 安装工具
 
@@ -238,19 +241,22 @@ sudo apt update
 sudo apt install clang lld llvm python3 python3-venv
 ```
 
-以下命令在本 README 所在目录执行，使用同一个 Bash 终端。先设置工具名称、输出目录和 LED 极性：
+以下命令在本 README 所在目录执行，使用同一个 Bash 终端。按你提供的 `/home/shenjiexiang/llvm-project` 配置工具路径，默认可执行文件在其 `build/bin` 下。先设置工具路径、输出目录和 LED 极性：
 
 ```bash
-CLANG=clang
-LLD=ld.lld
-OBJCOPY=llvm-objcopy
-OBJDUMP=llvm-objdump
+LLVM_BIN="${LLVM_BIN:-/home/shenjiexiang/llvm-project/build/bin}"
+CLANG="$LLVM_BIN/clang"
+LLD="$LLVM_BIN/ld.lld"
+OBJCOPY="$LLVM_BIN/llvm-objcopy"
+OBJDUMP="$LLVM_BIN/llvm-objdump"
 BUILD=build/led_uart
 LED_ACTIVE_LOW=0
 mkdir -p "$BUILD"
 ```
 
-如果安装的是带版本后缀的工具，把这四个工具变量设为实际名称，例如 `CLANG=clang-18`、`LLD=ld.lld-18`、`OBJCOPY=llvm-objcopy-18`、`OBJDUMP=llvm-objdump-18`；版本号仅为示例。板上 LED 低电平点亮时，将 `LED_ACTIVE_LOW` 设为 `1`。每次修改程序或极性后，都重新执行下面的编译、链接和镜像提取步骤。
+如果工具位于其他目录，先设置 `export LLVM_BIN=实际的可执行文件目录`，再执行上面的代码块；若名称带版本后缀，修改对应文件名。板上 LED 低电平点亮时，将 `LED_ACTIVE_LOW` 设为 `1`。每次修改程序或极性后，都重新执行下面的编译、链接、镜像提取和重排步骤。
+
+实际可执行文件位置的检查方法见 [Linux LLVM 编译指南](LLVM_LINUX_BUILD.md#2-准备-linux-工具)。当前未连接你的 Linux 服务器，需确认默认的 `build/bin` 目录存在。
 
 ### 第一步：编译启动汇编和 C 源文件
 
@@ -313,6 +319,21 @@ CPU_FLAGS=(
 
 `--only-section` 只提取指定输出段，`-O binary` 生成原始二进制，见 [llvm-objcopy 说明](https://llvm.org/docs/CommandGuide/llvm-objcopy.html)。链接脚本已把字符串和只读表合并进 `.data`，所以提取该段即可包含它们；`.bss` 不需要下载。
 
+### 第四步：最后用 bin2pqr5bin.py 重排
+
+```bash
+python3 bin2pqr5bin.py -binfile "$BUILD/imem.raw.bin" \
+    -baseaddr 0 -outfile "$BUILD/imem.flash.bin"
+
+python3 bin2pqr5bin.py -binfile "$BUILD/dmem.raw.bin" \
+    -baseaddr 0 -outfile "$BUILD/dmem.flash.bin"
+
+# 原脚本固定生成 C0 帧头；只修正数据镜像输出文件的前四字节。
+printf '\320\320\320\320' | dd of="$BUILD/dmem.flash.bin" bs=1 count=4 conv=notrunc status=none
+```
+
+原版脚本对每个 32 位字进行字节反序，并添加固定 `C0` 帧头和帧尾，没有 `-memtype` 选项。数据 RAM 需要 `D0` 帧头，所以上面用 Bash 命令修正生成的数据文件，保留 Python 脚本原样。两个 `-baseaddr` 都是各自 RAM 内的字节偏移 `0`，不能填 CPU 数据地址 `0x80000000` 或 loader 的 DRAM 基址 `0x10000000`。
+
 完整构建流程为：
 
 ```text
@@ -321,6 +342,9 @@ platform/start.S ───── clang ─→ start.o ────┴─ ld.lld 
 
 led_uart.elf ─┬─ llvm-objcopy .text → imem.raw.bin
              └─ llvm-objcopy .data → dmem.raw.bin
+
+imem.raw.bin ── bin2pqr5bin.py → imem.flash.bin
+dmem.raw.bin ── bin2pqr5bin.py + 修正输出帧头 → dmem.flash.bin
 ```
 
 不要直接把整个 ELF 转为一个二进制：代码和数据的起始地址相隔 `0x8000_0000`，合并提取可能产生巨大的填充区域，而且 loader 需要分别下载到两块 RAM。两个 raw 文件各自从相应 RAM 的偏移 0 开始。
@@ -332,16 +356,13 @@ led_uart.elf ─┬─ llvm-objcopy .text → imem.raw.bin
 | `led_uart.map` | 链接地址、段大小和符号布局 |
 | `program.lst` | 源码与汇编反汇编列表，用于理解实际执行指令 |
 | `imem.raw.bin`、`dmem.raw.bin` | 原始小端指令、数据镜像 |
+| `imem.flash.bin`、`dmem.flash.bin` | 重排并封装后的最终下载镜像 |
 
-上述命令只生成 ELF、原始镜像和辅助文件，不生成 `*.flash.bin`，也不自动下载。出现编译或链接错误时，先处理错误，再执行后续步骤，避免使用旧镜像。
+上述命令生成 ELF、原始镜像、重排后的 `*.flash.bin` 和辅助文件，不自动下载。出现编译、链接或转换错误时，先处理错误，再执行后续步骤，避免使用旧镜像。
 
 ## 7. 串口下载和独立打印
 
-### 当前下载脚本的缺失依赖
-
-**当前 `python_tools/peqflash.py` 还不能直接运行。** 它在文件开头执行 `from pack_flash import REGION_BYTES, make_image`，但当前目录没有 `pack_flash.py`。无论是否使用 `--raw`，甚至执行 `--help`，都会先因缺少该模块而失败。
-
-需要恢复根目录的 `pack_flash.py`，或将容量常量和打包函数整合进 `peqflash.py` 并去掉该导入。下面的下载命令以修复这一依赖为前提；LLVM 的编译步骤不依赖它。
+**当前下载依赖尚未补齐。** 原版 `python_tools/peqflash.py` 导入 `pack_flash.py`，但工程中缺少该文件，因此包括 `--help` 在内的调用都会失败。下面的下载命令以补齐这个原有依赖为前提；LLVM 编译和 `bin2pqr5bin.py` 重排不受影响。
 
 ### 板级连接
 
@@ -360,20 +381,19 @@ source ~/.venvs/cpu-uart/bin/activate
 python -m pip install pyserial
 ```
 
-修复打包依赖后，在工程目录中使用第 6 节生成的两个原始镜像：
+在工程目录中使用第 6 节经 `bin2pqr5bin.py` 重排后的两个镜像：
 
 ```sh
 python python_tools/peqflash.py \
     -serport /dev/ttyUSB0 -baud 115200 \
-    --raw \
-    -imembin build/led_uart/imem.raw.bin \
-    -dmembin build/led_uart/dmem.raw.bin \
+    -imembin build/led_uart/imem.flash.bin \
+    -dmembin build/led_uart/dmem.flash.bin \
     --monitor-port /dev/ttyUSB1 --monitor-baud 115200
 ```
 
-`--raw` 表示输入的是小端原始镜像，脚本在内存中添加 loader 协议，不要求预先生成 `*.flash.bin`。脚本不会编译 C，也不会检查镜像是否比源文件旧；每次改 C 程序都要重新构建。LED 极性由编译参数决定，不是下载参数。
+**这里不要加 `--raw`**：输入文件已经重排并添加 loader 协议，加上会重复处理。下载脚本不会编译 C，也不会检查镜像是否比源文件旧；每次改 C 程序都要重新构建并转换。LED 极性由编译参数决定，不是下载参数。
 
-当前脚本保留的 `--demo` 读取 `build/led_uart/imem.flash.bin` 和 `dmem.flash.bin`，其帮助文字仍提示执行 make；这与当前无 Makefile、只生成 raw 镜像的流程不一致，因此这里使用显式文件名和 `--raw`。
+补齐依赖后，也可以用 `--demo` 代替两个文件参数，读取 `build/led_uart/imem.flash.bin` 和 `dmem.flash.bin`。它只读取现有镜像，不执行编译或转换；原版帮助中的 make 提示不适用于当前工程，应按第 6 节构建。
 
 串口名称替换成实际设备名。`--monitor-baud` 对应 `CPU_UART_BPS`，`-baud` 对应 `UART_BPS`，默认均为 115200、8N1。若 Linux 提示串口权限不足，需要按发行版配置设备访问权限。
 
